@@ -24,7 +24,14 @@ invoicePage <- function(quote_id, project_id, project_title, project_type, platf
             br(),
             fluidRow(
               column(2, strong("Project Type:")),
-              column(10, textInput("project_id", NULL, value = project_type, width = "50%"))
+              column(10,
+                     selectInput(
+                       "project_type", NULL,
+                       choices  = c("Internal", "External"),
+                       selected = project_type,
+                       width    = "50%"
+                     )
+              )
             ),
             fluidRow(
               column(2, strong("Platform:")),
@@ -71,4 +78,5 @@ generateInvoiceTable <- function(invoice_items_data) {
   
   return(formatted)
 }
+
 
