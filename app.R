@@ -1,10 +1,12 @@
 library(shiny)
 library(readxl)
+library(readr)
+library(tools) 
 library(tidyr)
 library(DT)
 library(shinyjs)
 
-source("pages/invoice.R")
+source("invoice.R")
 # Parse data
 parse_data <- function(df) {
   df <- df %>% replace_na(replace = as.list(rep(0, ncol(df))))
@@ -20,11 +22,16 @@ ui <- fluidPage(
   uiOutput("main_ui")
 )
 
+num <- function(x) as.numeric(gsub("[^0-9.\\-]", "", x))   # strip $ and commas
+
 # SERVER
 server <- function(input, output, session) {
   # Page state
   current_page <- reactiveVal("main")
-  
+  extras <- reactiveValues(
+    internal = 1.1,
+    external = 1.3
+  )
   # Data containers
   raw_data <- reactiveVal(NULL)
   processed_data <- reactiveVal(NULL)
@@ -52,14 +59,36 @@ server <- function(input, output, session) {
   
   observeEvent(input$upload_button, {
     fp <- file_path()
-    if (!is.null(fp)) {
-      df <- read_excel(fp)
-      raw_data(df)
-      df <- parse_data(df)
-      processed_data(df)
-    } else {
+    if (is.null(fp)) {
       showNotification("Please upload a file first.", type = "warning")
+      return()
     }
+    
+    ext <- tolower(file_ext(fp))
+    if      (ext == "xlsx") df <- read_excel(fp)
+    else if (ext == "csv")  df <- read_csv(fp, show_col_types = FALSE)  # tidyverse style
+    else {
+      showNotification("Unsupported file type.", type = "error")
+      return()
+    }
+    
+    raw_data(df)
+    processed_data(parse_data(df))
+    if (all(c("Internal Extra", "External Extra") %in% names(df))) {
+      extras$internal <- unique(na.omit(df[["Internal Extra"]]))[1]
+      extras$external <- unique(na.omit(df[["External Extra"]]))[1]
+      
+      updateNumericInput(session, "internal_extra", value = extras$internal)
+      updateNumericInput(session, "external_extra", value = extras$external)
+    }
+  })
+  
+  observeEvent(input$internal_extra, {
+    extras$internal <- as.numeric(input$internal_extra)
+  })
+  
+  observeEvent(input$external_extra, {
+    extras$external <- as.numeric(input$external_extra)
   })
   
   # Navigate to invoice page
@@ -77,6 +106,13 @@ server <- function(input, output, session) {
   
   # Observe event for generating the final invoice 
   observeEvent(input$create_invoice_page, {
+    current_page("create_invoice")
+    output$invoice_type_ui <- renderUI({
+      radioButtons("invoice_type", "Select Invoice Type:",
+                   choices = c("Internal", "External"),
+                   selected = "Internal",
+                   inline = TRUE)
+    })
     if (is.null(invoice_items_data()) || nrow(invoice_items_data()) == 0) {
       # If empty, initialize it with an empty DataFrame
       invoice_items_data(data.frame(
@@ -88,41 +124,35 @@ server <- function(input, output, session) {
         stringsAsFactors = FALSE
       ))
     }
-    req(invoice_items_data())
-    
-    # navigating to a "invoice generated" page or triggering a download.
+    # Navigate to the invoice page
+    edited_invoice_table(invoice_table())
     current_page("invoice_generated")
   })
   
   # Go back
   observeEvent(input$back_to_main, {
     current_page("main")
-    # invoice_items_data(NULL)
   })
   
   # Extra info summary table
   extra_info_data <- reactive({
     req(processed_data())
-    df <- processed_data()
-    if (all(c("Internal Extra", "External Extra") %in% names(df))) {
-      return(data.frame(
-        `Internal Extra` = unique(na.omit(df[["Internal Extra"]]))[1],
-        `External Extra` = unique(na.omit(df[["External Extra"]]))[1]
-      ))
-    } else {
-      return(data.frame(`Internal Extra` = NA, `External Extra` = NA))
-    }
-  })
+    # ALWAYS use what the user sees / edits
+    data.frame(
+      `Internal Extra` = extras$internal,
+      `External Extra` = extras$external
+      )
+    })
   
   # Handle row selection in the data table
-  observeEvent(input$data_table_rows_selected, {
-    selected_rows <- input$data_table_rows_selected
-    if (!is.null(processed_data()) && length(selected_rows) > 0) {
-      invoice_items_data(processed_data()[selected_rows, ])
-    } else {
-      invoice_items_data(NULL)
-    }
-  })
+  # observeEvent(input$data_table_rows_selected, {
+  #   selected_rows <- input$data_table_rows_selected
+  #   if (!is.null(processed_data()) && length(selected_rows) > 0) {
+  #     invoice_items_data(processed_data()[selected_rows, ])
+  #   } else {
+  #     invoice_items_data(NULL)
+  #   }
+  # })
   
   output$extra_info_table <- renderTable({
     extra_info_data()
@@ -145,11 +175,17 @@ server <- function(input, output, session) {
                   sidebarPanel(
                     div(class = "sidebar-box",
                         h2("Create Genomics Invoicing"),
-                        fileInput("file", "Upload Master Spreadsheet (.xlsx)", accept = ".xlsx"),
+                        fileInput(
+                          "file",
+                          "Upload Master Spreadsheet (.xlsx or .csv)",
+                          accept = c(".xlsx", ".csv")   # ⬅️ add .csv
+                        ),
                         actionButton("upload_button", "Upload Master Spreadsheet", class = "upload-button"),
                         uiOutput("create_invoice_page_ui"),
                         br(),
-                        h4("Extra info (Internal/External)"),
+                        h4("Extra surcharge ($)"),
+                        numericInput("internal_extra", "Internal Extra:", value = extras$internal, min = 0),
+                        numericInput("external_extra", "External Extra:", value = extras$external, min = 0),
                         tableOutput("extra_info_table")
                     )
                   ),
@@ -161,29 +197,17 @@ server <- function(input, output, session) {
         )
       )
     } else if (current_page() == "create_invoice") {
-      # fluidPage(
-      #   div(class = "content",
-      #       div(class = "center-container",
-      #           h2("Select Items for Invoice"),
-      #           uiOutput("invoice_type_ui"),
-      #           DT::DTOutput("selected_items_table"),
-      #           br(),
-      #           actionButton("back_to_main", "Back to Main", class = "back-button"),
-      #           actionButton("generate_invoice", "Generate Invoice", class = "action-button")
-      #       )
-      #   )
-      # )
     }
     else if (current_page() == "invoice_generated") {
- 
-
-                edited_invoice_table(invoice_table())
-                invoicePage(quote_id = generateQuoteID(),
-                            project_id = "C0000001",
-                            project_title = "None",
-                            project_type = "Internal",
-                            platform = "Xenium")
-
+      
+      
+      edited_invoice_table(invoice_table())
+      invoicePage(quote_id = generateQuoteID(),
+                  project_id = "C0000001",
+                  project_title = "None",
+                  project_type = "Internal",
+                  platform = "Xenium")
+      
     }
   })
   
@@ -197,13 +221,27 @@ server <- function(input, output, session) {
   output$data_table <- DT::renderDataTable({
     req(processed_data())
     
-    # 👉 Select only specific columns to show
-    df <- processed_data()[, c("Product Code", "Brand","Product Category", "Product Name", "per reaction cost", "%PRJ surcharge","%EXTERNAL surcharge","Additional reagent Cost (not incl. in kit)")]
+    ## silent dependencies – ensures this code re‑runs when the user edits them
+    extras$internal ; extras$external
     
-    datatable(df,
+    df <- processed_data()
+    
+    # recalculate the two surcharge columns on the fly
+    df$`%PRJ surcharge`      <- round(num(df$`per reaction cost`)      * extras$internal, 2)
+    df$`%EXTERNAL surcharge` <- round(num(df$`per reaction cost`) * extras$external, 2)
+    
+    # (optional) pretty‑print with a dollar sign again
+    df$`%PRJ surcharge`      <- scales::dollar(df$`%PRJ surcharge`)
+    df$`%EXTERNAL surcharge` <- scales::dollar(df$`%EXTERNAL surcharge`)
+    
+    view_cols <- c("Product Code", "Brand", "Product Category", "Product Name",
+                   "per reaction cost", "%PRJ surcharge", "%EXTERNAL surcharge",
+                   "Additional reagent Cost (not incl. in kit)")
+    
+    datatable(df[ , view_cols],
               rownames = FALSE,
-              options = list(ordering = FALSE,
-                             language = list(search = "Search Item:")),
+              options  = list(ordering = FALSE,
+                              language = list(search = "Search Item:")),
               selection = "multiple")
   })
   
@@ -213,37 +251,42 @@ server <- function(input, output, session) {
     }
   })
   
-  # # Build invoice reactive
-  # observe({
-  #   req(processed_data(), input$data_table_rows_selected)
-  #   df <- processed_data()
-  #   selected_rows <- input$data_table_rows_selected
-  #   if (length(selected_rows) == 0) return()
-  #   
-  #   
-  #   selected_df <- df[selected_rows, ]
-  #   # Decide internal or external price
-  #   price_col <- if (input$invoice_type == "Internal") "%PRJ surcharge" else "%EXTERNAL surcharge"
-  #   
-  #   if (!(price_col %in% names(selected_df))) {
-  #     showNotification("Selected price column not found.", type = "error")
-  #     return()
-  #   }
-  #   
-  #   invoice_df <- selected_df[, c("Product Code", "Brand", "Product Category", "Product Name" ,price_col,"Additional reagent Cost (not incl. in kit)")]
-  #   names(invoice_df)[names(invoice_df) == price_col] <- "Base Price"
-  #   additional_col <- "Additional reagent Cost (not incl. in kit)"
-  #   names(invoice_df)[names(invoice_df) == additional_col] <- "Additional Cost"
-  #   
-  #   # Price = Original price + additional cost
-  #   invoice_df$Price <- invoice_df$`Base Price` + invoice_df$`Additional Cost`
-  #   
-  #   # Discount part
-  #   invoice_df$Discount <- 0
-  #   invoice_df$`New Price` <- invoice_df$Price
-  #   
-  #   invoice_items_data(invoice_df)
-  # })
+  # Build invoice reactive
+    observe({
+      req(processed_data(), input$data_table_rows_selected)
+      df <- processed_data()
+      selected_rows <- input$data_table_rows_selected
+      if (length(selected_rows) == 0) return()
+     
+      selected_df <- df[selected_rows, ]
+      # Decide internal or external price
+      price_col <- if (input$invoice_type == "Internal") "%PRJ surcharge" else "%EXTERNAL surcharge"
+      
+      if (!(price_col %in% names(selected_df))) {
+        showNotification("Selected price column not found.", type = "error")
+        return()
+      }
+      
+      invoice_df <- selected_df[ ,
+                  c("Product Code", "Brand", "Product Category", "Product Name",
+                    price_col, "Additional reagent Cost (not incl. in kit)")
+                ]
+      names(invoice_df)[names(invoice_df) == price_col] <- "Base Price"
+      invoice_df$`Base Price` <- invoice_df$`Base Price` *
+                                  (if (input$invoice_type == "Internal")
+                                      extras$internal else extras$external)
+
+      additional_col <- "Additional reagent Cost (not incl. in kit)"
+      names(invoice_df)[names(invoice_df) == additional_col] <- "Additional Cost"
+
+      # Price = Base + Additional
+      invoice_df$Price <- invoice_df$`Base Price` + invoice_df$`Additional Cost`
+            extra_to_add     <- if (input$invoice_type == "Internal")
+              extras$internal else extras$external
+            invoice_df$Price <- invoice_df$Price * extra_to_add
+            
+            invoice_items_data(invoice_df)  
+    })
   
   # Render selected items table (Discount editable)
   output$selected_items_table <- DT::renderDT({
@@ -305,14 +348,42 @@ server <- function(input, output, session) {
     }
   })
   
+  
   output$editable_invoice_table <- DT::renderDataTable({
     req(edited_invoice_table())
     datatable(
       edited_invoice_table(),
-      editable = TRUE, 
-      options = list(dom = 't', paging = FALSE),
+      editable = TRUE,
+      options  = list(dom = 't', paging = FALSE),
       rownames = FALSE
     )
+  })
+  
+  # DT proxy – put this immediately after the renderDataTable block
+  proxy_edit <- dataTableProxy("editable_invoice_table")
+  
+  observeEvent(edited_invoice_table(), {
+    replaceData(proxy_edit, edited_invoice_table(), resetPaging = FALSE)
+  })
+  
+  # ----- fix the add‑row observer -----
+  observeEvent(input$add_row, {
+    temp <- edited_invoice_table()
+    if (is.null(temp)) {
+      showNotification("No invoice table loaded. Please select items first.", type = "error")
+      return()
+    }
+    
+    new_row <- data.frame(
+      Item        = "",
+      Description = "",
+      Quantity    = 1,
+      Amount      = 0,
+      Total       = 0,
+      stringsAsFactors = FALSE
+    )
+    
+    edited_invoice_table(rbind(temp, new_row))
   })
   
   
@@ -342,7 +413,7 @@ server <- function(input, output, session) {
   
   
   
-   observeEvent(input$add_row, {
+  observeEvent(input$add_row, {
     temp <- edited_invoice_table()
     
     if (is.null(temp)) {
@@ -365,7 +436,7 @@ server <- function(input, output, session) {
       "per HashTag",
       "per test vial"
     )
-
+    
     # Create new row with dropdown icons
     new_row <- data.frame(
       Item = item_options[1],
@@ -420,15 +491,14 @@ server <- function(input, output, session) {
   
   
   output$download_invoice <- downloadHandler(
-    filename = function() {
-      paste0("Invoice_", Sys.Date(), ".pdf")
-    },
-    content = function(file) {
-      # Save a temporary Rmd file
-      tempReport <- file.path(tempdir(), "invoice.Rmd")
+    filename = function() paste0("Invoice_", Sys.Date(), ".pdf"),
+    content  = function(file) {
+      tempReport  <- file.path(tempdir(), "invoice.Rmd")
       file.copy("invoice.Rmd", tempReport, overwrite = TRUE)
+      
+      # If the table is empty, pass an empty DataFrame
       pdf_table_data <- if (!is.null(edited_invoice_table()) && nrow(edited_invoice_table()) > 0) {
-        edited_invoice_table()
+        generateInvoiceTable(edited_invoice_table())
       } else {
         data.frame(Item = character(0), Description = character(0), Quantity = numeric(0), Amount = numeric(0), Total = numeric(0))
       }
@@ -439,23 +509,19 @@ server <- function(input, output, session) {
         quote_id = input$quote_id,
         project_id = input$project_id,
         project_title = input$project_title,
-        project_type = input$project_type,
+        project_type = input$project_type,  # Fix project_type here
         platform = input$platform,
         table_data = pdf_table_data
       )
       
-      # Use tempdir() to save in the default system temp directory
-      output_path <- file.path(tempdir(), paste0("Invoice_", Sys.Date(), ".pdf"))
-      
-      rmarkdown::render(
+      out <- rmarkdown::render(
         tempReport,
-        output_file = output_path,
-        params = params,
-        envir = new.env(parent = globalenv())
+        output_format = "pdf_document",   # <<‑‑‑ here
+        output_file   = file.path(tempdir(), "invoice_tmp.pdf"),
+        params        = params,
+        envir         = new.env(parent = globalenv())
       )
-      
-      # Move the generated file to the 'file' parameter (Shiny will then serve it to the user)
-      file.copy(output_path, file)
+      file.copy(out, file, overwrite = TRUE)
     }
   )
   
